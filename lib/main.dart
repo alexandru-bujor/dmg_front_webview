@@ -1,7 +1,11 @@
+// lib/main.dart
 import 'package:flutter/material.dart';
 import 'webview_shell.dart';
 
-void main() => runApp(const DMGWebViewApp());
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const DMGWebViewApp());
+}
 
 class DMGWebViewApp extends StatelessWidget {
   const DMGWebViewApp({super.key});
@@ -11,7 +15,19 @@ class DMGWebViewApp extends StatelessWidget {
     return MaterialApp(
       title: 'DMG',
       debugShowCheckedModeBanner: false,
-      home: const WebViewShell(startUrl: 'https://pdr.vecdev.md/'),
+      theme: ThemeData(
+        colorSchemeSeed: const Color(0xFF2563EB),
+        useMaterial3: true,
+      ),
+      home: const WebViewShell(
+        startUrl: 'https://estimatemaster.pro/',
+        firstPartyHosts: {
+          'estimatemaster.pro',
+          'www.estimatemaster.pro',
+          'api.estimatemaster.pro',
+          'dmg-api.vecdev.md',
+        },
+      ),
     );
   }
 }

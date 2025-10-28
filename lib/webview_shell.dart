@@ -1,3 +1,4 @@
+// lib/webview_shell.dart
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
@@ -5,7 +6,18 @@ import 'package:url_launcher/url_launcher.dart';
 
 class WebViewShell extends StatefulWidget {
   final String startUrl;
-  const WebViewShell({super.key, required this.startUrl});
+  final Set<String> firstPartyHosts;
+
+  const WebViewShell({
+    super.key,
+    required this.startUrl,
+    this.firstPartyHosts = const {
+      'estimatemaster.pro',
+      'www.estimatemaster.pro',
+      'api.estimatemaster.pro',
+      'dmg-api.vecdev.md',
+    },
+  });
 
   @override
   State<WebViewShell> createState() => _WebViewShellState();
@@ -28,116 +40,237 @@ class _WebViewShellState extends State<WebViewShell> {
     });
   }
 
+  // ---------- helpers ----------
+  bool _isFirstParty(WebUri? u) {
+    if (u == null) return false;
+    return widget.firstPartyHosts.contains(u.host.toLowerCase());
+  }
+
+  bool _isExternalScheme(WebUri u) {
+    const schemes = {
+      'mailto', 'tel', 'sms', 'maps', 'whatsapp', 'tg', 'viber', 'intent', 'market'
+    };
+    return schemes.contains(u.scheme.toLowerCase());
+  }
+
+  bool _isBlockedScheme(WebUri u) {
+    final s = u.scheme.toLowerCase();
+    const blocked = {'chrome-extension', 'chrome', 'devtools', 'about', 'blob', 'data'};
+    if (blocked.contains(s)) return true;
+    if (s == 'file') return true; // block file:// unless explicitly allowed
+    return false;
+  }
+
+  Future<bool> _maybeHandleAndroidSpecial(WebUri u) async {
+    if (!Platform.isAndroid) return false;
+    final s = u.scheme.toLowerCase();
+    if (s == 'intent' || s == 'market') {
+      return _handleExternal(Uri.parse(u.toString()));
+    }
+    return false;
+  }
+
+  Future<bool> _handleExternal(Uri uri) async {
+    if (await canLaunchUrl(uri)) {
+      return launchUrl(uri, mode: LaunchMode.externalApplication);
+    }
+    return false;
+  }
+
+  Widget _offlineView() {
+    return Scaffold(
+      body: Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Text('Connection or renderer issue'),
+          const SizedBox(height: 8),
+          FilledButton(
+            onPressed: () async {
+              if (!mounted) return;
+              setState(() => _offline = false);
+              await _controller?.reload();
+            },
+            child: const Text('Retry'),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  // ---------- build ----------
   @override
   Widget build(BuildContext context) {
-    if (_offline) {
-      return Scaffold(
-        body: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text('You are offline'),
-              const SizedBox(height: 12),
-              ElevatedButton(
-                onPressed: () => setState(() => _offline = false),
-                child: const Text('Retry'),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
+    if (_offline) return _offlineView();
 
-    return Scaffold(
-      body: SafeArea(
-        child: InAppWebView(
-          // WebUri is required by flutter_inappwebview 6.x
-          initialUrlRequest: URLRequest(url: WebUri(widget.startUrl)),
-          initialSettings: InAppWebViewSettings(
-            javaScriptEnabled: true,
-            transparentBackground: false,
-            allowsInlineMediaPlayback: true,
-            mediaPlaybackRequiresUserGesture: false,
-            userAgent: _mobileUA,
-            useOnDownloadStart: true,
-            useOnLoadResource: true,
-            sharedCookiesEnabled: true,
-            thirdPartyCookiesEnabled: true,
-            allowsBackForwardNavigationGestures: true,
-          ),
-          pullToRefreshController: _pullToRefreshController,
-          onWebViewCreated: (c) async {
-            _controller = c;
-          },
-          onLoadStop: (c, _) async {
-            _pullToRefreshController.endRefreshing();
-            await c.evaluateJavascript(source: _bridgeScript);
-          },
-          onPermissionRequest: (c, req) async {
-            return PermissionResponse(
-              resources: req.resources,
-              action: PermissionResponseAction.GRANT,
-            );
-          },
-          shouldOverrideUrlLoading: (c, nav) async {
-            final url = nav.request.url; // WebUri?
-            if (url == null) return NavigationActionPolicy.ALLOW;
+    return PopScope(
+      canPop: true,
+      onPopInvoked: (didPop) async {
+        if (didPop) return;
+        final c = _controller;
+        if (c != null && await c.canGoBack()) {
+          await c.goBack();
+        } else {
+          if (context.mounted) Navigator.of(context).maybePop();
+        }
+      },
+      child: Scaffold(
+        body: SafeArea(
+          child: InAppWebView(
+            initialUrlRequest: URLRequest(url: WebUri(widget.startUrl)),
+            initialSettings: InAppWebViewSettings(
+              javaScriptEnabled: true,
+              transparentBackground: false,
+              allowsInlineMediaPlayback: true,
+              mediaPlaybackRequiresUserGesture: false,
+              userAgent: _mobileUA,
+              useOnDownloadStart: true,
+              useOnLoadResource: true,
+              sharedCookiesEnabled: true,
+              thirdPartyCookiesEnabled: true,
+              allowsBackForwardNavigationGestures: true,
+              supportMultipleWindows: false, // ⬅️ do NOT spawn child webviews
+              disableDefaultErrorPage: true,
+            ),
+            pullToRefreshController: _pullToRefreshController,
 
-            final host = url.host;
-            final isLocal = host == 'localhost' && url.port == 3000;
-            if (isLocal) return NavigationActionPolicy.ALLOW;
+            onWebViewCreated: (c) {
+              _controller = c;
+              // JS bridge (void methods — do not await)
+              c.addJavaScriptHandler(
+                handlerName: "log",
+                callback: (args) {
+                  debugPrint("[JS log] $args");
+                  return null;
+                },
+              );
+              c.addJavaScriptHandler(
+                handlerName: "notify",
+                callback: (args) => {"ok": true},
+              );
+              c.addJavaScriptHandler(
+                handlerName: "pushToken",
+                callback: (args) => {"stored": true},
+              );
+            },
 
-            // Handle external schemes (convert WebUri -> Uri for url_launcher)
-            if (['mailto', 'tel', 'sms', 'maps', 'whatsapp', 'tg', 'intent']
-                .contains(url.scheme)) {
-              final asUri = Uri.parse(url.toString());
-              if (await canLaunchUrl(asUri)) {
-                await launchUrl(asUri, mode: LaunchMode.externalApplication);
+            onLoadStop: (c, _) async {
+              _pullToRefreshController.endRefreshing();
+              if (!mounted) return;
+              c.evaluateJavascript(source: _bridgeScript);
+            },
+
+            onReceivedError: (c, request, error) {
+              // Offline only when top document fails
+              if (request.isForMainFrame == true && mounted) {
+                setState(() => _offline = true);
+              }
+            },
+
+            onReceivedHttpError: (c, request, response) {
+              if (request.isForMainFrame == true) {
+                debugPrint('[WEB HTTP ${response.statusCode}] ${request.url}');
+              }
+            },
+
+            // Renderer crash → recover gracefully
+            onRenderProcessGone: (controller, detail) async {
+              if (mounted) setState(() => _offline = true);
+              // return type is Future<void> in 6.x → no return value
+            },
+
+            onConsoleMessage: (c, msg) {
+              // ConsoleMessageLevel may not have `.name` in your version
+              debugPrint('[WEB ${msg.messageLevel.toString()}] ${msg.message}');
+            },
+
+            // We don’t create child windows; let policy handle all nav
+            onCreateWindow: (c, req) async {
+              // Return false so target=_blank falls back to policy handler.
+              return false;
+            },
+
+            onDownloadStartRequest: (c, req) async {
+              final uri = Uri.parse(req.url.toString());
+              await _handleExternal(uri);
+            },
+
+            onPermissionRequest: (c, req) async {
+              return PermissionResponse(
+                resources: req.resources,
+                action: PermissionResponseAction.GRANT,
+              );
+            },
+
+            shouldOverrideUrlLoading: (c, nav) async {
+              final url = nav.request.url;
+              if (url == null) return NavigationActionPolicy.ALLOW;
+
+              // 🚫 Block unsupported/extension schemes
+              if (_isBlockedScheme(url)) return NavigationActionPolicy.CANCEL;
+
+              // ✅ First-party → load inside
+              if (_isFirstParty(url)) {
+                // If site attempted to open a popup, force same-view load.
+                // (Avoids new WebViews which can crash on some devices.)
+                if (nav.androidIsRedirect == false &&
+                    nav.iosWKNavigationType == IOSWKNavigationType.LINK_ACTIVATED) {
+                  c.loadUrl(urlRequest: URLRequest(url: url));
+                  return NavigationActionPolicy.CANCEL;
+                }
+                return NavigationActionPolicy.ALLOW;
+              }
+
+              // Android intent/market
+              if (await _maybeHandleAndroidSpecial(url)) {
                 return NavigationActionPolicy.CANCEL;
               }
-            }
 
-            // Confirm leaving the app
-            final leave = await showDialog<bool>(
-                  context: context,
-                  builder: (_) => AlertDialog(
-                    title: const Text('Leave app?'),
-                    content:
-                        Text('Open ${url.toString()} in external app?'),
-                    actions: [
-                      TextButton(
-                        onPressed: () => Navigator.pop(context, false),
-                        child: const Text('Cancel'),
+              // External deeplinks
+              if (_isExternalScheme(url)) {
+                await _handleExternal(Uri.parse(url.toString()));
+                return NavigationActionPolicy.CANCEL;
+              }
+
+              // Other http(s) → confirm leaving the app
+              if (url.scheme.startsWith('http')) {
+                if (!context.mounted) return NavigationActionPolicy.CANCEL;
+                final leave = await showDialog<bool>(
+                      context: context,
+                      builder: (_) => AlertDialog(
+                        title: const Text('Leave app?'),
+                        content: Text('Open ${url.toString()} in external app?'),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(context, false),
+                            child: const Text('Cancel'),
+                          ),
+                          TextButton(
+                            onPressed: () => Navigator.pop(context, true),
+                            child: const Text('Open'),
+                          ),
+                        ],
                       ),
-                      TextButton(
-                        onPressed: () => Navigator.pop(context, true),
-                        child: const Text('Open'),
-                      ),
-                    ],
-                  ),
-                ) ??
-                false;
+                    ) ??
+                    false;
 
-            // Guard context after async gap
-            if (!mounted) return NavigationActionPolicy.CANCEL;
+                if (!context.mounted) return NavigationActionPolicy.CANCEL;
+                if (leave) {
+                  await _handleExternal(Uri.parse(url.toString()));
+                }
+                return NavigationActionPolicy.CANCEL;
+              }
 
-            if (leave) {
-              await launchUrl(
-                Uri.parse(url.toString()),
-                mode: LaunchMode.externalApplication,
-              );
-            }
-            return NavigationActionPolicy.CANCEL;
-          },
-          // New signature in 6.x: (controller, request, error)
-          onReceivedError: (c, request, error) {
-            setState(() => _offline = true);
-          },
+              return NavigationActionPolicy.ALLOW;
+            },
+          ),
         ),
       ),
     );
   }
 
   String get _bridgeScript =>
-      'window.FlutterBridge = { notify:(t,p)=>window.flutter_inappwebview.callHandler("notify",t,p), log:(e,p)=>window.flutter_inappwebview.callHandler("log",e,p), pushToken:(tok)=>window.flutter_inappwebview.callHandler("pushToken",tok) };';
+      'window.FlutterBridge = { '
+      'notify:(t,p)=>window.flutter_inappwebview.callHandler("notify",t,p), '
+      'log:(e,p)=>window.flutter_inappwebview.callHandler("log",e,p), '
+      'pushToken:(tok)=>window.flutter_inappwebview.callHandler("pushToken",tok) '
+      '};';
 }
