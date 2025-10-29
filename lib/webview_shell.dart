@@ -1,4 +1,3 @@
-// lib/webview_shell.dart
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
@@ -27,6 +26,9 @@ class _WebViewShellState extends State<WebViewShell> {
   late final PullToRefreshController _pullToRefreshController;
   InAppWebViewController? _controller;
   bool _offline = false;
+  bool _isDisposed = false;
+
+  bool get _safe => mounted && !_isDisposed;
 
   String get _mobileUA => Platform.isIOS
       ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
@@ -36,19 +38,38 @@ class _WebViewShellState extends State<WebViewShell> {
   void initState() {
     super.initState();
     _pullToRefreshController = PullToRefreshController(onRefresh: () async {
-      await _controller?.reload();
+      try {
+        await _controller?.reload();
+      } finally {
+        _pullToRefreshController.endRefreshing();
+      }
     });
   }
 
-  // ---------- helpers ----------
+  @override
+  void dispose() {
+    _isDisposed = true;
+    _controller = null;
+    super.dispose();
+  }
+
   bool _isFirstParty(WebUri? u) {
     if (u == null) return false;
-    return widget.firstPartyHosts.contains(u.host.toLowerCase());
+    final host = u.host.toLowerCase();
+    return widget.firstPartyHosts.contains(host);
   }
 
   bool _isExternalScheme(WebUri u) {
     const schemes = {
-      'mailto', 'tel', 'sms', 'maps', 'whatsapp', 'tg', 'viber', 'intent', 'market'
+      'mailto',
+      'tel',
+      'sms',
+      'maps',
+      'whatsapp',
+      'tg',
+      'viber',
+      'intent',
+      'market'
     };
     return schemes.contains(u.scheme.toLowerCase());
   }
@@ -57,7 +78,7 @@ class _WebViewShellState extends State<WebViewShell> {
     final s = u.scheme.toLowerCase();
     const blocked = {'chrome-extension', 'chrome', 'devtools', 'about', 'blob', 'data'};
     if (blocked.contains(s)) return true;
-    if (s == 'file') return true; // block file:// unless explicitly allowed
+    if (s == 'file') return true;
     return false;
   }
 
@@ -80,37 +101,47 @@ class _WebViewShellState extends State<WebViewShell> {
   Widget _offlineView() {
     return Scaffold(
       body: Center(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          const Text('Connection or renderer issue'),
-          const SizedBox(height: 8),
-          FilledButton(
-            onPressed: () async {
-              if (!mounted) return;
-              setState(() => _offline = false);
-              await _controller?.reload();
-            },
-            child: const Text('Retry'),
-          ),
-        ]),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Connection or renderer issue'),
+            const SizedBox(height: 8),
+            FilledButton(
+              onPressed: () async {
+                if (!_safe) return;
+                setState(() => _offline = false);
+                try {
+                  await _controller?.reload();
+                } catch (_) {}
+              },
+              child: const Text('Retry'),
+            ),
+          ],
+        ),
       ),
     );
   }
 
-  // ---------- build ----------
   @override
   Widget build(BuildContext context) {
     if (_offline) return _offlineView();
 
     return PopScope(
       canPop: true,
-      onPopInvoked: (didPop) async {
+      onPopInvoked: (didPop) {
         if (didPop) return;
-        final c = _controller;
-        if (c != null && await c.canGoBack()) {
-          await c.goBack();
-        } else {
-          if (context.mounted) Navigator.of(context).maybePop();
-        }
+        Future<void>(() async {
+          final c = _controller;
+          if (c == null || !_safe) return;
+          try {
+            final canBack = await c.canGoBack();
+            if (canBack) {
+              await c.goBack();
+            } else {
+              if (_safe && context.mounted) Navigator.of(context).maybePop();
+            }
+          } catch (_) {}
+        });
       },
       child: Scaffold(
         body: SafeArea(
@@ -127,40 +158,49 @@ class _WebViewShellState extends State<WebViewShell> {
               sharedCookiesEnabled: true,
               thirdPartyCookiesEnabled: true,
               allowsBackForwardNavigationGestures: true,
-              supportMultipleWindows: false, // ⬅️ do NOT spawn child webviews
+
+              /// Important for iOS popup links (target=_blank / window.open)
+              supportMultipleWindows: true,
+              javaScriptCanOpenWindowsAutomatically: true,
+
+              /// Important for Android stability (fixes various picker crashes)
+              android: AndroidInAppWebViewOptions(
+                useHybridComposition: true, // ← reduces crashes with inputs/pickers
+                builtInZoomControls: false,
+                displayZoomControls: false,
+                // Optional: improves forms
+                domStorageEnabled: true,
+                databaseEnabled: true,
+                allowFileAccess: false,
+                allowContentAccess: true,
+              ),
+
+              /// Disable Flutter’s default error page
               disableDefaultErrorPage: true,
             ),
+
             pullToRefreshController: _pullToRefreshController,
 
             onWebViewCreated: (c) {
               _controller = c;
-              // JS bridge (void methods — do not await)
-              c.addJavaScriptHandler(
-                handlerName: "log",
-                callback: (args) {
-                  debugPrint("[JS log] $args");
-                  return null;
-                },
-              );
-              c.addJavaScriptHandler(
-                handlerName: "notify",
-                callback: (args) => {"ok": true},
-              );
-              c.addJavaScriptHandler(
-                handlerName: "pushToken",
-                callback: (args) => {"stored": true},
-              );
+            },
+
+            onLoadStart: (c, _) {
+              if (_safe && _offline) setState(() => _offline = false);
             },
 
             onLoadStop: (c, _) async {
               _pullToRefreshController.endRefreshing();
-              if (!mounted) return;
-              c.evaluateJavascript(source: _bridgeScript);
+
+              // Force web-style <input type="time"> (prevents Android picker crashes)
+              await c.evaluateJavascript(source: _forceWebTimeUiJs);
+
+              // Keep all new windows in the same tab (prevents iOS → Safari)
+              await c.evaluateJavascript(source: _forceSameTabJs);
             },
 
             onReceivedError: (c, request, error) {
-              // Offline only when top document fails
-              if (request.isForMainFrame == true && mounted) {
+              if (request.isForMainFrame == true && _safe) {
                 setState(() => _offline = true);
               }
             },
@@ -171,26 +211,33 @@ class _WebViewShellState extends State<WebViewShell> {
               }
             },
 
-            // Renderer crash → recover gracefully
             onRenderProcessGone: (controller, detail) async {
-              if (mounted) setState(() => _offline = true);
-              // return type is Future<void> in 6.x → no return value
+              if (_safe) setState(() => _offline = true);
+              _controller = null;
             },
 
             onConsoleMessage: (c, msg) {
-              // ConsoleMessageLevel may not have `.name` in your version
-              debugPrint('[WEB ${msg.messageLevel.toString()}] ${msg.message}');
+              debugPrint('[WEB ${msg.messageLevel}] ${msg.message}');
             },
 
-            // We don’t create child windows; let policy handle all nav
+            /// iOS new-window handler: load popup URLs in the SAME webview
             onCreateWindow: (c, req) async {
-              // Return false so target=_blank falls back to policy handler.
+              final u = req.request.url;
+              if (u != null) {
+                try {
+                  await c.loadUrl(urlRequest: URLRequest(url: u));
+                } catch (_) {}
+              }
+              // We didn't create a new view – we consumed it.
               return false;
             },
 
+            onCloseWindow: (c) async {
+              // No new window was created; nothing to close.
+            },
+
             onDownloadStartRequest: (c, req) async {
-              final uri = Uri.parse(req.url.toString());
-              await _handleExternal(uri);
+              await _handleExternal(Uri.parse(req.url.toString()));
             },
 
             onPermissionRequest: (c, req) async {
@@ -204,33 +251,33 @@ class _WebViewShellState extends State<WebViewShell> {
               final url = nav.request.url;
               if (url == null) return NavigationActionPolicy.ALLOW;
 
-              // 🚫 Block unsupported/extension schemes
               if (_isBlockedScheme(url)) return NavigationActionPolicy.CANCEL;
 
-              // ✅ First-party → load inside
+              // First-party → keep in-app
               if (_isFirstParty(url)) {
-                // If site attempted to open a popup, force same-view load.
-                // (Avoids new WebViews which can crash on some devices.)
+                // iOS LINK_ACTIVATED to same-view for consistency
                 if (nav.androidIsRedirect == false &&
                     nav.iosWKNavigationType == IOSWKNavigationType.LINK_ACTIVATED) {
-                  c.loadUrl(urlRequest: URLRequest(url: url));
+                  try {
+                    await c.loadUrl(urlRequest: URLRequest(url: url));
+                  } catch (_) {}
                   return NavigationActionPolicy.CANCEL;
                 }
                 return NavigationActionPolicy.ALLOW;
               }
 
-              // Android intent/market
+              // Android special schemes (intent / market)
               if (await _maybeHandleAndroidSpecial(url)) {
                 return NavigationActionPolicy.CANCEL;
               }
 
-              // External deeplinks
+              // External apps (tel:, mailto:, etc.)
               if (_isExternalScheme(url)) {
                 await _handleExternal(Uri.parse(url.toString()));
                 return NavigationActionPolicy.CANCEL;
               }
 
-              // Other http(s) → confirm leaving the app
+              // Other http(s): ask user before leaving app
               if (url.scheme.startsWith('http')) {
                 if (!context.mounted) return NavigationActionPolicy.CANCEL;
                 final leave = await showDialog<bool>(
@@ -252,10 +299,7 @@ class _WebViewShellState extends State<WebViewShell> {
                     ) ??
                     false;
 
-                if (!context.mounted) return NavigationActionPolicy.CANCEL;
-                if (leave) {
-                  await _handleExternal(Uri.parse(url.toString()));
-                }
+                if (leave) await _handleExternal(Uri.parse(url.toString()));
                 return NavigationActionPolicy.CANCEL;
               }
 
@@ -267,10 +311,94 @@ class _WebViewShellState extends State<WebViewShell> {
     );
   }
 
-  String get _bridgeScript =>
-      'window.FlutterBridge = { '
-      'notify:(t,p)=>window.flutter_inappwebview.callHandler("notify",t,p), '
-      'log:(e,p)=>window.flutter_inappwebview.callHandler("log",e,p), '
-      'pushToken:(tok)=>window.flutter_inappwebview.callHandler("pushToken",tok) '
-      '};';
+  // --- JS: force web-style time input (prevents native picker crashes on Android) ---
+  String get _forceWebTimeUiJs => r'''
+    (function () {
+      if (window.__FORCE_WEB_TIME_UI__) return;
+      window.__FORCE_WEB_TIME_UI__ = true;
+
+      function upgrade(el) {
+        if (!el || el.__web_time_upgraded) return;
+
+        var val = el.value;
+        var ph  = el.getAttribute('placeholder') || 'HH:MM';
+
+        try { el.type = 'text'; } catch (e) {
+          var n = el.cloneNode(true);
+          n.setAttribute('type','text');
+          el.parentNode && el.parentNode.replaceChild(n, el);
+          el = n;
+        }
+
+        el.setAttribute('inputmode', 'numeric');
+        el.setAttribute('pattern', '\\\\d{2}:\\\\d{2}');
+        if (val && /^\d{2}:\d{2}$/.test(val)) el.value = val;
+        if (!el.getAttribute('placeholder')) el.setAttribute('placeholder', ph);
+
+        el.__web_time_upgraded = true;
+      }
+
+      function scan(root) {
+        (root || document).querySelectorAll('input[type="time"]').forEach(upgrade);
+      }
+
+      scan(document);
+
+      var obs = new MutationObserver(function (muts) {
+        muts.forEach(function (m) {
+          if (m.type === 'childList') {
+            m.addedNodes && m.addedNodes.forEach(function (n) {
+              if (n && n.nodeType === 1) scan(n);
+            });
+          } else if (m.type === 'attributes' && m.target && m.target.matches && m.target.matches('input[type="time"]')) {
+            upgrade(m.target);
+          }
+        });
+      });
+      obs.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['type'] });
+
+      var style = document.createElement('style');
+      style.textContent = `
+        input[type="time"]::-webkit-calendar-picker-indicator { display: none !important; }
+        input[type="time"]::-webkit-clear-button { display: none !important; }
+      `;
+      document.documentElement.appendChild(style);
+    })();
+  ''';
+
+  // --- JS: keep target=_blank / window.open inside the same tab (iOS & Android) ---
+  String get _forceSameTabJs => r'''
+    (function () {
+      if (window.__FORCE_SAME_TAB__) return;
+      window.__FORCE_SAME_TAB__ = true;
+
+      var _open = window.open;
+      window.open = function (url, name, specs) {
+        try {
+          if (typeof url === 'string' && url.length) {
+            location.href = url;
+            return null;
+          }
+        } catch (e) {}
+        return _open.apply(window, arguments);
+      };
+
+      function retarget(root) {
+        (root || document).querySelectorAll('a[target="_blank"]').forEach(function(a){
+          a.setAttribute('target','_self');
+        });
+      }
+
+      retarget(document);
+      new MutationObserver(function(muts){
+        muts.forEach(function(m){
+          if (m.addedNodes) {
+            m.addedNodes.forEach(function(n){
+              if (n && n.querySelectorAll) retarget(n);
+            });
+          }
+        });
+      }).observe(document.documentElement, {subtree:true, childList:true});
+    })();
+  ''';
 }
